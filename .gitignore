@@ -1,0 +1,22 @@
+# Environnement Python et caches
+qwen_env/
+__pycache__/
+*.pyc
+
+# Configuration personnelle (chemins, transcription, jeton Hugging Face)
+qwen_tts_studio_config.json
+
+# Voix et rendus : ne publiez jamais la voix d'autrui sans son accord
+VOIX/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.mp4
+*.mkv
+*.mov
+*-chapitres.txt
+
+# Modèles téléchargés localement
+modeles/
+*.safetensors
