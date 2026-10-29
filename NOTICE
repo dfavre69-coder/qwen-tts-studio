@@ -1,0 +1,23 @@
+Qwen3-TTS Voice Studio
+Copyright 2026 Denis Favre
+
+Ce logiciel est distribué sous licence Apache 2.0 (voir LICENSE).
+
+Il s'appuie sur des logiciels tiers, installés séparément et non inclus
+dans ce dépôt :
+
+  - Qwen3-TTS (paquet qwen-tts, code, tokenizers et poids des modèles)
+    Copyright Alibaba Qwen Team — licence Apache 2.0
+    https://github.com/QwenLM/Qwen3-TTS
+
+  - Hugging Face transformers — licence Apache 2.0
+    https://github.com/huggingface/transformers
+    (acceleration_qwen.py reproduit la logique de tirage température /
+    top-k / top-p de transformers)
+
+  - PyTorch — licence BSD
+    https://pytorch.org
+
+  - FFmpeg — licences LGPL / GPL selon la compilation, programme externe
+    appelé en ligne de commande
+    https://ffmpeg.org
