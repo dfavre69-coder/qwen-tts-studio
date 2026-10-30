@@ -27,6 +27,8 @@ Ce guide s'adresse à tout le monde, y compris aux personnes qui n'ont jamais ut
 | **Lot** | Groupe de morceaux générés en même temps par la carte graphique. Plus le lot est grand, plus c'est rapide, tant que la mémoire suffit. |
 | **VRAM** | La mémoire de la carte graphique. C'est elle qui limite la taille des lots. |
 | **GPU** | La carte graphique. L'application a besoin d'une carte NVIDIA pour être rapide. |
+| **Whisper** | Un modèle de reconnaissance vocale : il « écoute » de l'audio et l'écrit en texte. Le studio s'en sert pour transcrire les voix de référence et vérifier les phrases générées. Téléchargé au premier usage (environ 1,6 Go). |
+| **M4B** | Le format standard des livres audio : un seul fichier, avec chapitres, couverture, titre et auteur. |
 
 ---
 
@@ -87,6 +89,8 @@ La qualité de la voix clonée dépend presque entièrement de cet enregistremen
 - ❌ Une transcription approximative : le modèle s'en sert pour comprendre comment la voix prononce chaque son.
 - ❌ La voix de quelqu'un sans son accord.
 
+**Pas envie de taper la transcription ?** Cliquez sur **🎧 Transcrire automatiquement** : Whisper écoute l'extrait et remplit le champ en quelques secondes. Relisez quand même le résultat : un nom propre ou un mot rare peut être mal compris.
+
 Si vous laissez la transcription vide, l'application utilise seulement l'**empreinte** de la voix. Ça fonctionne, mais le résultat est nettement moins fidèle.
 
 ---
@@ -104,7 +108,7 @@ En bas de la fenêtre, quel que soit l'onglet :
 | Champ | Explication |
 |---|---|
 | **Voix de référence** | Le fichier audio de la voix à imiter. |
-| **Transcription exacte** | Le texte prononcé dans cet extrait. |
+| **Transcription exacte** | Le texte prononcé dans cet extrait. Le bouton **🎧 Transcrire automatiquement** le remplit pour vous. |
 | **Fichier texte à lire** | Votre texte : `.docx` (Word), `.md` ou `.txt`. |
 | **Dossier de sortie** | Où enregistrer le résultat. Par défaut, le dossier du texte. |
 | **Nom de base du rendu** | Le nom du fichier produit. Cochez **Horodater** pour ne jamais écraser un rendu précédent : la date et l'heure sont alors ajoutées au nom. |
@@ -120,6 +124,38 @@ En bas de la fenêtre, quel que soit l'onglet :
 | **Silences** | Pauses ajoutées après une virgule, un point ou un paragraphe, en secondes. |
 | **Niveau cible (dBFS)** | Volume maximal de chaque phrase. −3 est fort sans saturer. |
 | **Fréquence supplémentaire** | Crée aussi une version en 44 100 Hz (standard des CD et des podcasts) ou en 48 000 Hz (standard de la vidéo). |
+
+### Onglet « Livre & Qualité »
+
+**Qualité**
+- **Contrôle qualité automatique (Whisper)** : une fois toutes les phrases générées, Whisper les réécoute une à une et compare ce qu'il entend au texte. Une phrase trop différente (mot sauté, répétition, boucle) est **régénérée automatiquement**, deux fois au plus, et la meilleure version est gardée. Comptez 10 à 20 % de temps en plus. Les phrases encore douteuses sont listées dans le journal.
+- **Créer les sous-titres (.srt)** : un fichier de sous-titres parfaitement synchronisé, à joindre à votre vidéo YouTube (*Sous-titres → Importer un fichier*).
+
+**Dialogues à plusieurs voix**
+1. Créez un dossier et placez-y un extrait audio par personnage : `Marie.wav`, `Paul.wav`… La règle est la même que pour la voix principale : 10 à 30 s, au calme.
+2. Indiquez ce dossier dans **Dossier des voix**.
+3. Dans votre texte, commencez chaque réplique par le nom du personnage entre crochets :
+
+   ```
+   [Marie] Tu as vu l'heure ?
+   [Paul] : Il est encore tôt.
+   Le vent se leva sur la lande.
+   ```
+
+   La balise vaut pour **un paragraphe**. Le paragraphe suivant, s'il n'a pas de balise, revient à la voix principale (celle de l'onglet *Entrées*). La balise `[Narrateur]` désigne aussi la voix principale.
+4. La transcription de chaque voix se met dans un fichier texte du même nom (`Marie.txt`). S'il manque, Whisper la crée automatiquement au premier rendu.
+
+Le bouton **Aperçu du découpage** indique pour chaque balise si la voix a été trouvée. Une voix introuvable est remplacée par la voix principale.
+
+**Livre audio**
+- Cochez **Créer un livre audio M4B** : le studio découpe le livre en chapitres d'après les **titres** du document (style *Titre 1* de Word, ou ligne `#` en Markdown).
+- Renseignez le **titre**, l'**auteur** et, si vous le souhaitez, une **couverture** (JPG ou PNG, carrée de préférence).
+- Vous obtenez un fichier `.m4b` lisible dans Apple Livres, VLC, Smart AudioBook Player, BookPlayer… avec des chapitres navigables, et un fichier `-chapitres.txt` prêt à coller dans une description YouTube.
+
+**Correction**
+- Avec **Conserver les morceaux** coché (par défaut), chaque phrase est gardée dans un dossier `…_projet`, à côté du rendu.
+- **✎ Corriger des phrases…** ouvre la liste des phrases du dernier rendu, avec leur score de contrôle qualité. Les phrases douteuses sont en rouge. Double-cliquez sur une phrase pour l'écouter, sélectionnez celles à refaire, puis cliquez sur **🔁 Régénérer la sélection**. Seules ces phrases sont recalculées, puis tous les fichiers (WAV, MP3, SRT, M4B) sont refaits en quelques secondes.
+- Pour corriger un rendu plus ancien, le bouton propose d'ouvrir son fichier `projet.json`.
 
 ### Onglet « Export MP3 »
 
@@ -170,6 +206,10 @@ Le panneau **Journal** affiche en direct ce que fait l'application.
 | `⏱ 32 phrases en 9.8 s` | La vitesse de chaque série de lots. |
 | `💾 VRAM utilisée : 11.8 Go` | La mémoire de la carte graphique occupée. |
 | `⚠ VRAM pleine … lot réduit à 16` | La mémoire était saturée : l'application a réduit le lot d'elle-même. En fin de rendu, elle vous indique la valeur à retenir. |
+| `[  12/346] … [Marie] : …` | Ce morceau est lu avec la voix de Marie. |
+| `🔎 Contrôle qualité : 346 phrases écoutées, 4 à reprendre` | Whisper a trouvé 4 phrases différentes du texte : elles vont être régénérées. |
+| `⚠ 1 phrase(s) encore douteuse(s) : n° 87` | Même après deux nouvelles tentatives, cette phrase reste différente du texte. Écoutez-la : souvent, c'est seulement un nom propre que Whisper a mal compris. |
+| `🧩 Morceaux conservés pour correction` | Le dossier qui permettra de corriger des phrases plus tard. |
 | `⚠ Phrase coupée à la durée maximale` | Le modèle a « bouclé » sur cette phrase et ne s'arrêtait plus. Elle a été coupée : écoutez ce passage et relancez le rendu si besoin. |
 
 Le rendu terminé, l'application indique la durée de l'audio et le temps de calcul.
@@ -212,7 +252,9 @@ ACCELERATION = False
 
 ## 7. Bien préparer son texte
 
-- **Les intertitres** doivent se terminer par un point. Sinon, ils sont lus d'un trait avec la phrase suivante.
+- **Les titres** mis en forme avec les styles de Word (*Titre 1*, *Titre 2*…) ou les `#` du Markdown reçoivent automatiquement un point final : ils ne sont plus lus d'un trait avec la phrase suivante. Pour un livre audio, ce sont aussi eux qui définissent les chapitres.
+- **Les intertitres en simple texte** (sans style de titre) doivent se terminer par un point.
+- **Les dialogues** : commencez chaque réplique par `[Nom]` pour la faire lire par une autre voix (voir l'onglet *Livre & Qualité*).
 - **Les nombres** sont écrits automatiquement en toutes lettres, jusqu'à 999 999. Au-delà, mieux vaut les écrire vous-même.
 - **Les abréviations** (M., Dr, etc.) sont lues telles quelles : écrivez-les en entier.
 - **Les sigles** sont lus comme des mots s'ils sont prononçables. Sinon, écrivez-les avec des points (`S.N.C.F.`) ou en toutes lettres.
@@ -233,6 +275,10 @@ ACCELERATION = False
 | Pas de MP3 ni de vidéo | ffmpeg est introuvable. | Onglet **Export MP3** → **🔍 Détecter ffmpeg**, ou relancez `installer.bat`. |
 | La voix ne ressemble pas assez | Référence bruitée, trop courte, ou transcription inexacte. | Voir la [section 3](#3-préparer-une-bonne-voix-de-référence). |
 | Une phrase est répétée, étirée ou coupée | Le modèle a « bouclé » : ça arrive rarement, c'est dû au tirage aléatoire. | Relancez le rendu. Si le problème revient, reformulez ou découpez la phrase. |
+| Le premier contrôle qualité ou la première transcription reste longtemps sur « Chargement de Whisper » | Whisper (1,6 Go) est en cours de téléchargement. | Patientez. Ça n'arrive qu'une seule fois. |
+| Le contrôle qualité signale des phrases qui sonnent bien | Whisper a mal compris un nom propre, un mot étranger ou un terme rare. | Écoutez la phrase. Si elle est correcte, ignorez l'alerte. |
+| Pas de chapitres dans le M4B | Le document n'utilise pas de styles de titre. | Dans Word, appliquez le style *Titre 1* aux titres de chapitre. En Markdown, faites-les commencer par `# `. |
+| Une réplique `[Marie]` est lue avec la voix principale | `Marie.wav` est introuvable dans le dossier des voix. | Vérifiez le nom du fichier avec **Aperçu du découpage** (les majuscules ne comptent pas). |
 | `lancer_studio.bat` affiche « L'environnement n'est pas installé » | `installer.bat` n'a pas été lancé, ou n'a pas abouti. | Lancez ou relancez `installer.bat`. |
 
 ---

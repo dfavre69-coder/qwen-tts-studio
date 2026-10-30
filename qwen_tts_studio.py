@@ -20,6 +20,14 @@
       acceleration_qwen.py (CUDA Graph) — environ 7 s d'audio par seconde
       de calcul sur une RTX A4500
     • Export WAV, rééchantillonnage 44,1 / 48 kHz, export MP3
+    • Transcription automatique de la voix de référence (Whisper)
+    • Contrôle qualité : Whisper réécoute chaque phrase et fait régénérer
+      celles qui ne correspondent pas au texte
+    • Sous-titres .srt synchronisés
+    • Dialogues à plusieurs voix : balises [Nom] en début de paragraphe
+    • Livre audio M4B : un chapitre par titre du document, couverture,
+      titre et auteur
+    • Correction : régénération de quelques phrases sans tout relancer
     • Montage vidéo : image fixe + piste audio → MP4 / MKV / MOV
     • Fusion de plusieurs fichiers audio avec chapitrage automatique
       (description YouTube, fichier texte, chapitres intégrés)
@@ -384,8 +392,20 @@ def duree_silence_apres(chunk, est_fin_paragraphe, sil_virgule, sil_point, sil_p
 #  SECTION 3 — LECTURE DES FICHIERS TEXTE (txt / md / docx)
 # =============================================================================
 
-def lire_fichier_texte(chemin):
-    """Lit un fichier texte. Prend en charge .txt, .md et .docx (Word)."""
+def _ponctuer_titre(texte):
+    """Ajoute un point final à un titre qui n'en a pas : sans lui, le titre
+    serait lu d'un trait avec la phrase suivante."""
+    t = texte.strip()
+    if t and not re.search(r'[.!?…:;]["»”)\]]*$', t):
+        t += "."
+    return t
+
+
+def lire_paragraphes(chemin):
+    """Lit un document en conservant sa structure. Renvoie une liste de
+    paragraphes {"texte", "niveau", "titre"} : niveau 0 pour un paragraphe
+    ordinaire, 1 à 9 pour un titre de ce niveau (styles Word « Titre 1 »,
+    « Heading 1 »… ou « # » en Markdown)."""
     ext = os.path.splitext(chemin)[1].lower()
 
     if ext == ".docx":
@@ -397,12 +417,18 @@ def lire_fichier_texte(chemin):
                 "Installe-le avec :  pip install python-docx"
             )
         doc = Document(chemin)
-        lignes = []
+        paragraphes = []
         for p in doc.paragraphs:
-            lignes.append(p.text)
-        # On joint par des sauts de ligne : la logique de fin de paragraphe
-        # (silence plus long) s'appuie sur ces retours.
-        return "\n".join(lignes)
+            try:
+                nom = (p.style.name or "") if p.style is not None else ""
+            except Exception:
+                nom = ""
+            m = re.match(r'(?i)^\s*(heading|titre)\s*(\d)\s*$', nom)
+            est_titre = bool(m) or nom.strip().lower() in ("title", "titre")
+            paragraphes.append({"texte": p.text,
+                                "niveau": int(m.group(2)) if m else 0,
+                                "titre": est_titre})
+        return paragraphes
 
     if ext == ".doc":
         raise RuntimeError(
@@ -412,7 +438,112 @@ def lire_fichier_texte(chemin):
 
     # .txt, .md, et tout autre format texte brut
     with open(chemin, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+        contenu = f.read()
+    markdown = ext in (".md", ".markdown")
+    paragraphes = []
+    for ligne in contenu.splitlines():
+        m = re.match(r'^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$', ligne) if markdown else None
+        if m:
+            paragraphes.append({"texte": m.group(2), "niveau": len(m.group(1)), "titre": True})
+        else:
+            paragraphes.append({"texte": ligne, "niveau": 0, "titre": False})
+    return paragraphes
+
+
+def lire_fichier_texte(chemin):
+    """Lit un fichier texte (.txt, .md, .docx) et le renvoie d'un bloc, un
+    paragraphe par ligne. Les titres reçoivent un point final s'il manque."""
+    return "\n".join(
+        _ponctuer_titre(p["texte"]) if (p["titre"] and p["texte"].strip()) else p["texte"]
+        for p in lire_paragraphes(chemin))
+
+
+# Balise de voix en tête de paragraphe : « [Marie] Bonjour… » ou « [Marie] : … »
+BALISE_VOIX = re.compile(r'^\s*\[([^\[\]\n]{1,40})\]\s*[:\-–—]?\s*')
+NOMS_NARRATEUR = {"narrateur", "narratrice", "narration", "récit", "recit", "voix principale"}
+EXTENSIONS_VOIX = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
+
+
+def construire_plan(paragraphes, max_chars, par_chapitres=False):
+    """Prépare le rendu : découpe le texte en chunks et note, pour chacun, la
+    voix qui le lit (balise [Nom] en tête de paragraphe ; None = voix
+    principale) et le chapitre auquel il appartient (titres du document, si
+    par_chapitres). Renvoie un dict : chunks [(texte, fin_para)], voix,
+    chapitre, titres, stats."""
+    niveaux = [p["niveau"] for p in paragraphes if p["niveau"] > 0 and p["texte"].strip()]
+    niveau_chap = min(niveaux) if (par_chapitres and niveaux) else None
+
+    blocs = []          # [chapitre, voix, [textes]]
+    titres = []
+    chap = -1
+    for p in paragraphes:
+        t = p["texte"]
+        if not t.strip():
+            continue
+        voix = None
+        if niveau_chap and 0 < p["niveau"] <= niveau_chap:
+            titres.append(t.strip())
+            chap = len(titres) - 1
+            texte = _ponctuer_titre(t)
+        else:
+            if niveau_chap and chap == -1:
+                titres.append("Introduction")
+                chap = 0
+            m = BALISE_VOIX.match(t)
+            if m and not p.get("titre"):
+                nom = m.group(1).strip()
+                voix = None if nom.lower() in NOMS_NARRATEUR else nom
+                t = t[m.end():]
+            texte = _ponctuer_titre(t) if p.get("titre") else t
+        c = max(chap, 0)
+        if blocs and blocs[-1][0] == c and blocs[-1][1] == voix:
+            blocs[-1][2].append(texte)
+        else:
+            blocs.append([c, voix, [texte]])
+
+    chunks, voix_l, chap_l, nettoye = [], [], [], []
+    for c, voix, textes in blocs:
+        morceaux, st = construire_chunks("\n".join(textes), max_chars)
+        if not morceaux:
+            continue
+        morceaux[-1] = (morceaux[-1][0], True)       # fin de bloc = fin de paragraphe
+        chunks += morceaux
+        voix_l += [voix] * len(morceaux)
+        chap_l += [c] * len(morceaux)
+        nettoye.append(st["texte_nettoye"])
+
+    utilises = sorted(set(chap_l))
+    renum = {ancien: i for i, ancien in enumerate(utilises)}
+    chap_l = [renum[c] for c in chap_l]
+    titres = [titres[c] if c < len(titres) else "" for c in utilises] if niveau_chap else [""]
+
+    tailles = [len(c) for c, _ in chunks] or [0]
+    stats = {
+        "nb_chunks": len(chunks),
+        "min": min(tailles),
+        "max": max(tailles),
+        "moyenne": sum(tailles) // max(len(tailles), 1),
+        "nb_fin_para": sum(1 for _, fp in chunks if fp),
+        "texte_nettoye": "\n".join(nettoye),
+        "voix": sorted({v for v in voix_l if v}),
+        "nb_chapitres": len(titres) if niveau_chap else 0,
+    }
+    return {"chunks": chunks, "voix": voix_l, "chapitre": chap_l,
+            "titres": titres, "stats": stats}
+
+
+def trouver_voix(dossier, nom):
+    """Cherche « Nom.wav » (ou .flac, .mp3…) dans le dossier des voix, sans
+    tenir compte des majuscules. Renvoie (audio, transcription ou None)."""
+    if not dossier or not os.path.isdir(dossier):
+        return None
+    cible = nom.strip().lower()
+    for f in sorted(os.listdir(dossier)):
+        base, ext = os.path.splitext(f)
+        if ext.lower() in EXTENSIONS_VOIX and base.strip().lower() == cible:
+            txt = os.path.join(dossier, base + ".txt")
+            return os.path.join(dossier, f), (txt if os.path.isfile(txt) else None)
+    return None
 
 
 def trouver_ffmpeg(chemin_manuel=None):
@@ -615,13 +746,499 @@ def charger_modele(config, bus, cache):
     return model, device
 
 
+# =============================================================================
+#  SECTION 3 bis — TRANSCRIPTION (WHISPER) ET CONTRÔLE QUALITÉ
+# =============================================================================
+# Whisper passe par transformers, déjà installé pour Qwen3-TTS : aucun paquet
+# supplémentaire. Le modèle (~1,6 Go) est téléchargé au premier usage.
+
+WHISPER_MODELE = "openai/whisper-large-v3-turbo"
+SEUIL_QC = 0.75          # conformité minimale entre le texte et ce qu'a entendu Whisper
+QC_TENTATIVES = 2        # nouvelles générations au plus pour une phrase douteuse
+
+
+def charger_whisper(cache, device, bus):
+    """Charge (une seule fois) la reconnaissance vocale Whisper."""
+    if cache.get("whisper") is not None:
+        return cache["whisper"]
+    torch = precharger_modules()["torch"]
+    from transformers import pipeline
+    bus.log(f"Chargement de Whisper ({WHISPER_MODELE}) — environ 1,6 Go "
+            "téléchargés au premier usage…")
+    dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+    pipe = pipeline("automatic-speech-recognition", model=WHISPER_MODELE,
+                    dtype=dtype, device=device)
+    cache["whisper"] = pipe
+    return pipe
+
+
+def transcrire(pipe, audios, sr, langue, taille_lot=8):
+    """Transcrit une liste de signaux (numpy, fréquence sr). Renvoie une
+    liste de textes, dans le même ordre."""
+    mods = precharger_modules()
+    np, resample_poly = mods["np"], mods["resample_poly"]
+    entrees = []
+    for a in audios:
+        a = np.asarray(a, dtype=np.float32)
+        if a.ndim > 1:
+            a = a.mean(axis=1)
+        if sr != 16000:
+            d = gcd(16000, int(sr))
+            a = resample_poly(a, 16000 // d, int(sr) // d).astype(np.float32)
+        entrees.append(a)
+    options = {"task": "transcribe"}
+    if langue:
+        options["language"] = str(langue).lower()
+    textes = [""] * len(entrees)
+    courts = [i for i, a in enumerate(entrees) if len(a) <= 30 * 16000]
+    if courts:
+        res = pipe([{"raw": entrees[i], "sampling_rate": 16000} for i in courts],
+                   batch_size=max(1, taille_lot), generate_kwargs=options)
+        for i, r in zip(courts, res):
+            textes[i] = (r.get("text") or "").strip()
+    for i, a in enumerate(entrees):              # au-delà de 30 s : mode long
+        if len(a) > 30 * 16000:
+            r = pipe({"raw": a, "sampling_rate": 16000},
+                     return_timestamps=True, generate_kwargs=options)
+            textes[i] = (r.get("text") or "").strip()
+    return textes
+
+
+def mots_pour_comparaison(texte):
+    """Normalise un texte pour le comparer à une transcription : nombres en
+    lettres, minuscules, sans ponctuation ni traits d'union."""
+    t = nettoyer_texte_pour_audio(texte).lower()
+    t = t.replace("’", "'").replace("-", " ")
+    t = re.sub(r"[^\w\s']", " ", t)
+    t = t.replace("'", "' ")
+    return t.split()
+
+
+def score_conformite(source, transcrit):
+    """Ressemblance (0 à 1) entre le texte à lire et ce que Whisper a entendu."""
+    import difflib
+    a, b = mots_pour_comparaison(source), mots_pour_comparaison(transcrit)
+    if not a and not b:
+        return 1.0
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def transcrire_fichier(chemin, langue, cache, device, bus):
+    """Transcrit un fichier audio entier (voix de référence)."""
+    sf = precharger_modules()["sf"]
+    data, sr = sf.read(chemin, dtype="float32", always_2d=False)
+    pipe = charger_whisper(cache, device, bus)
+    duree = len(data) / sr
+    return transcrire(pipe, [data], sr, langue)[0], duree
+
+
+def worker_transcription(chemin, langue, device, bus, cache):
+    """Thread : transcrit la voix de référence et renvoie le texte à l'interface."""
+    try:
+        torch = precharger_modules()["torch"]
+        if device == "auto":
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        bus.status("Transcription de la voix de référence…")
+        texte, duree = transcrire_fichier(chemin, langue, cache, device, bus)
+        bus.file.put(("transcription", texte, duree))
+    except Exception as e:  # noqa: BLE001
+        bus.file.put(("transcription_erreur", str(e)))
+
+
+# =============================================================================
+#  SECTION 3 ter — SOUS-TITRES, LIVRE AUDIO M4B, PROJET DE CORRECTION
+# =============================================================================
+
+def _horodate_srt(secondes):
+    ms = int(round(max(0.0, secondes) * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _couper_lignes(texte, largeur=42):
+    """Coupe un sous-titre en deux lignes équilibrées, sur un espace."""
+    if len(texte) <= largeur:
+        return texte
+    milieu = len(texte) // 2
+    espaces = [i for i, c in enumerate(texte) if c == " "]
+    if not espaces:
+        return texte
+    i = min(espaces, key=lambda x: abs(x - milieu))
+    return texte[:i] + "\n" + texte[i + 1:]
+
+
+def ecrire_srt(segments, chemin, max_car=84):
+    """segments : [(debut_s, fin_s, texte)]. Un chunk trop long est réparti en
+    plusieurs sous-titres, au prorata du nombre de caractères."""
+    blocs, n = [], 0
+    for debut, fin, texte in segments:
+        parties, courant = [], ""
+        for mot in texte.split():
+            if courant and len(courant) + 1 + len(mot) > max_car:
+                parties.append(courant)
+                courant = mot
+            else:
+                courant = (courant + " " + mot).strip()
+        if courant:
+            parties.append(courant)
+        total = sum(len(p) for p in parties) or 1
+        t = debut
+        for p in parties:
+            d = (fin - debut) * len(p) / total
+            n += 1
+            blocs.append(f"{n}\n{_horodate_srt(t)} --> {_horodate_srt(t + d)}\n"
+                         f"{_couper_lignes(p)}\n")
+            t += d
+    with open(chemin, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocs))
+    return chemin
+
+
+def creer_m4b(ffmpeg, source, chapitres, duree_totale, sortie, titre, auteur,
+              couverture, bus, debit="96k"):
+    """Livre audio M4B : audio AAC, chapitres navigables, titre, auteur et
+    couverture. chapitres : [{"debut", "libelle"}]."""
+    meta = os.path.splitext(sortie)[0] + ".ffmeta.txt"
+    lignes = [";FFMETADATA1"]
+    for cle, valeur in (("title", titre), ("album", titre), ("artist", auteur),
+                        ("album_artist", auteur), ("genre", "Audiobook")):
+        if valeur:
+            lignes.append(f"{cle}={_echapper_ffmetadata(valeur)}")
+    for i, ch in enumerate(chapitres):
+        fin = chapitres[i + 1]["debut"] if i + 1 < len(chapitres) else duree_totale
+        lignes += ["[CHAPTER]", "TIMEBASE=1/1000",
+                   f"START={int(ch['debut'] * 1000)}",
+                   f"END={int(max(fin, ch['debut'] + 0.001) * 1000)}",
+                   f"title={_echapper_ffmetadata(ch['libelle'])}"]
+    with open(meta, "w", encoding="utf-8") as f:
+        f.write("\n".join(lignes) + "\n")
+
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", source, "-i", meta]
+    avec_image = bool(couverture) and os.path.isfile(couverture)
+    if avec_image:
+        cmd += ["-i", couverture]
+    cmd += ["-map", "0:a"]
+    if avec_image:
+        cmd += ["-map", "2:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
+    cmd += ["-map_metadata", "1", "-map_chapters", "1",
+            "-c:a", "aac", "-b:a", debit, "-ac", "1",
+            "-movflags", "+faststart", "-f", "mp4", sortie]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, **options_subprocess())
+        bus.log(f"   ✓ Livre audio M4B ({len(chapitres)} chapitres) : {os.path.abspath(sortie)}")
+        return True
+    except subprocess.CalledProcessError as e:
+        detail = e.stderr.decode("utf-8", errors="replace").strip()[-300:] if e.stderr else ""
+        bus.log(f"   ❌ Création du M4B impossible : {detail}")
+    except Exception as e:  # noqa: BLE001
+        bus.log(f"   ❌ Création du M4B impossible : {e}")
+    finally:
+        try:
+            os.unlink(meta)
+        except Exception:
+            pass
+    return False
+
+
+def dossier_projet(chemin_wav):
+    """Dossier où sont conservés les morceaux d'un rendu (pour correction)."""
+    return os.path.splitext(chemin_wav)[0] + "_projet"
+
+
+def sauver_projet(projet, audios, sr):
+    """Enregistre chaque morceau (WAV 32 bits flottants) et le fichier
+    projet.json qui décrit le rendu."""
+    sf = precharger_modules()["sf"]
+    dossier = dossier_projet(projet["sortie"]["wav"])
+    os.makedirs(os.path.join(dossier, "morceaux"), exist_ok=True)
+    for k, c in enumerate(projet["chunks"]):
+        if k < len(audios) and audios[k] is not None:
+            nom = f"{k + 1:04d}.wav"
+            sf.write(os.path.join(dossier, "morceaux", nom), audios[k], sr, subtype="FLOAT")
+            c["fichier"] = nom
+    projet["sr"] = sr
+    with open(os.path.join(dossier, "projet.json"), "w", encoding="utf-8") as f:
+        json.dump(projet, f, ensure_ascii=False, indent=1)
+    return dossier
+
+
+def charger_projet(dossier):
+    """Relit projet.json et les morceaux d'un rendu précédent."""
+    sf = precharger_modules()["sf"]
+    with open(os.path.join(dossier, "projet.json"), encoding="utf-8") as f:
+        projet = json.load(f)
+    audios = []
+    for c in projet["chunks"]:
+        chemin = os.path.join(dossier, "morceaux", c.get("fichier") or "")
+        if c.get("fichier") and os.path.isfile(chemin):
+            data, _ = sf.read(chemin, dtype="float32")
+            audios.append(data)
+        else:
+            audios.append(None)
+    return projet, audios
+
+
+def assembler_et_exporter(projet, audios, sr, limite, bus):
+    """Assemble les morceaux dans l'ordre (avec les silences) et produit
+    toutes les sorties demandées : WAV, version rééchantillonnée, MP3,
+    sous-titres SRT, livre audio M4B et chapitrage. Renvoie un dict
+    {fichiers, principal, duree} ou None si rien n'a été généré."""
+    mods = precharger_modules()
+    np, sf, resample_poly = mods["np"], mods["sf"], mods["resample_poly"]
+    r = projet["reglages"]
+    chunks = projet["chunks"]
+
+    pieces, segments, debuts = [], [], {}
+    curseur = 0
+    for k in range(min(limite, len(chunks))):
+        a = audios[k]
+        if a is None:
+            continue
+        c = chunks[k]
+        a = normaliser_peak(a, r["target_peak"])
+        debuts.setdefault(c["chapitre"], curseur / sr)
+        segments.append((curseur / sr, (curseur + len(a)) / sr, c["texte"]))
+        pieces.append(a)
+        curseur += len(a)
+        dur = duree_silence_apres(c["texte"], c["fin_para"],
+                                  r["sil_virgule"], r["sil_point"], r["sil_para"])
+        silence = np.zeros(int(dur * sr), dtype=np.float32)
+        pieces.append(silence)
+        curseur += len(silence)
+    if not pieces:
+        return None
+
+    audio_complet = np.concatenate(pieces).astype(np.float32)
+    chemin_wav = projet["sortie"]["wav"]
+    os.makedirs(os.path.dirname(os.path.abspath(chemin_wav)), exist_ok=True)
+    sf.write(chemin_wav, audio_complet, sr)
+    duree = len(audio_complet) / sr
+    base = os.path.splitext(chemin_wav)[0]
+    bus.log(f"🎭 Fichier natif ({sr} Hz) : {os.path.abspath(chemin_wav)}")
+    bus.log(f"   Durée : {int(duree // 60)} min {int(duree % 60)} sec")
+    fichiers = [chemin_wav]
+
+    # --- Version rééchantillonnée ---
+    chemin_resample = None
+    freq = r.get("freq_supp")
+    if freq and int(freq) != sr:
+        fs = int(freq)
+        d = gcd(fs, sr)
+        bus.log(f"   Rééchantillonnage {sr} → {fs} Hz…")
+        audio_rs = resample_poly(audio_complet, up=fs // d, down=sr // d).astype(np.float32)
+        chemin_resample = f"{base}-{fs}.wav"
+        sf.write(chemin_resample, audio_rs, fs)
+        bus.log(f"   ✓ Version {fs} Hz : {os.path.abspath(chemin_resample)}")
+        fichiers.append(chemin_resample)
+        audio_rs = None
+
+    ffmpeg = None
+    if r.get("export_mp3") or r.get("livre"):
+        ffmpeg = trouver_ffmpeg(r.get("ffmpeg_path"))
+        if ffmpeg is None:
+            bus.log("   ⚠️  ffmpeg introuvable — MP3 et livre audio ignorés. "
+                    "Indique son chemin dans l'onglet Export.")
+
+    # --- MP3 ---
+    if r.get("export_mp3") and ffmpeg:
+        src = r.get("mp3_source", "auto")
+        if src == "resample" and chemin_resample:
+            source_mp3 = chemin_resample
+        elif src == "natif":
+            source_mp3 = chemin_wav
+        else:
+            source_mp3 = chemin_resample or chemin_wav
+        nom_mp3 = os.path.splitext(source_mp3)[0] + ".mp3"
+        cmd = [ffmpeg, "-y", "-i", source_mp3, "-c:a", "libmp3lame",
+               "-b:a", r.get("mp3_bitrate", "192k"),
+               "-ac", "1" if r.get("mp3_mono", True) else "2", nom_mp3]
+        bus.log(f"   Encodage MP3 ({r.get('mp3_bitrate', '192k')})…")
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, **options_subprocess())
+            bus.log(f"   ✓ MP3 : {os.path.abspath(nom_mp3)}")
+            fichiers.append(nom_mp3)
+        except subprocess.CalledProcessError as e:
+            bus.log(f"   ❌ Erreur ffmpeg (code {e.returncode}).")
+            if e.stderr:
+                bus.log(e.stderr.decode("utf-8", errors="replace")[-400:])
+
+    # --- Sous-titres ---
+    if r.get("srt"):
+        chemin_srt = ecrire_srt(segments, base + ".srt")
+        bus.log(f"   ✓ Sous-titres : {os.path.abspath(chemin_srt)}")
+        fichiers.append(chemin_srt)
+
+    # --- Chapitres et livre audio ---
+    titres = projet.get("titres") or []
+    if r.get("livre") and any(titres):
+        chapitres = [{"debut": debuts[i], "libelle": titres[i] or f"Chapitre {i + 1}"}
+                     for i in sorted(debuts)]
+        chapitres[0]["debut"] = 0.0
+        chemin_chap = base + "-chapitres.txt"
+        with open(chemin_chap, "w", encoding="utf-8") as f:
+            f.write(formater_chapitres(chapitres, duree, "youtube") + "\n")
+        bus.log(f"   ✓ Chapitrage ({len(chapitres)} chapitres) : {os.path.abspath(chemin_chap)}")
+        fichiers.append(chemin_chap)
+        if ffmpeg:
+            chemin_m4b = base + ".m4b"
+            if creer_m4b(ffmpeg, chemin_wav, chapitres, duree, chemin_m4b,
+                         r.get("livre_titre", ""), r.get("livre_auteur", ""),
+                         r.get("livre_couverture", ""), bus):
+                fichiers.append(chemin_m4b)
+    elif r.get("livre"):
+        bus.log("   ⚠ Aucun titre trouvé dans le document : pas de chapitres. "
+                "Utilise les styles « Titre 1 » de Word ou des « # » en Markdown.")
+
+    return {"fichiers": fichiers, "principal": chemin_wav, "duree": duree}
+
+
+def fabriquer_generateur(model, prompts, voix_par_chunk, chunks, langue, bus):
+    """Renvoie generer(indices) -> (wavs, sr) : génère d'un coup les chunks
+    demandés, chacun avec sa voix, et plafonne la durée contre les boucles."""
+    def plafond_trames(textes):
+        # Le modèle produit 12,5 trames par seconde, soit ~0,6 trame par
+        # caractère en français. Plafond à ~4x cette valeur : une phrase
+        # qui « boucle » (le modèle ne s'arrête pas) ne peut plus retenir
+        # tout son lot jusqu'à la limite d'origine de 2 048 trames (2 min 44).
+        return int(40 + 2.5 * max(len(t) for t in textes))
+
+    def generer(indices):
+        textes = [chunks[k][0] for k in indices]
+        plafond = plafond_trames(textes)
+        # Le modèle Base ignore toute consigne de ton : seule la voix de
+        # référence compte. On ne transmet donc pas `instruct`.
+        wavs, sr = model.generate_voice_clone(
+            text=textes,
+            language=langue,
+            voice_clone_prompt=[prompts[voix_par_chunk[k]] for k in indices],
+            max_new_tokens=plafond,
+        )
+        limite = 0.95 * plafond / 12.5 * sr
+        for k, t, w in zip(indices, textes, wavs):
+            if len(w) >= limite:
+                bus.log(f"   ⚠ Phrase {k + 1} coupée à la durée maximale (le modèle a "
+                        f"probablement bouclé) : « {t[:50]}… » — à vérifier à l'écoute.")
+        return wavs, sr
+    return generer
+
+
+def preparer_voix(model, config, noms, bus, cache, device):
+    """Empreintes vocales : voix principale (clé None) et voix des balises
+    [Nom] trouvées dans le dossier des voix. Une voix sans transcription
+    (Nom.txt) est transcrite par Whisper, et la transcription enregistrée.
+    Renvoie (prompts, sources) ; sources décrit chaque voix pour le projet."""
+    sf = precharger_modules()["sf"]
+    ref, ref_text = config["ref_audio"], (config.get("ref_text") or "").strip()
+    sources = {None: {"audio": ref, "transcription": ref_text}}
+    manquantes = []
+    for nom in noms:
+        trouve = trouver_voix(config.get("dossier_voix"), nom)
+        if not trouve:
+            manquantes.append(nom)
+            continue
+        audio, chemin_txt = trouve
+        transcription = ""
+        if chemin_txt:
+            with open(chemin_txt, encoding="utf-8", errors="replace") as f:
+                transcription = f.read().strip()
+        if not transcription:
+            try:
+                transcription, _ = transcrire_fichier(audio, config["language"],
+                                                      cache, device, bus)
+                with open(os.path.splitext(audio)[0] + ".txt", "w", encoding="utf-8") as f:
+                    f.write(transcription)
+                bus.log(f"   🎧 Voix « {nom} » transcrite automatiquement "
+                        f"(enregistrée dans {os.path.basename(os.path.splitext(audio)[0])}.txt).")
+            except Exception as e:  # noqa: BLE001
+                bus.log(f"   ⚠ Transcription automatique de « {nom} » impossible ({e}) : "
+                        "empreinte seule.")
+        sources[nom] = {"audio": audio, "transcription": transcription}
+    if manquantes:
+        bus.log("⚠ Voix introuvables dans le dossier des voix : "
+                + ", ".join(manquantes) + " — la voix principale les remplace.")
+
+    prompts = {}
+    for nom, s in sources.items():
+        try:
+            prompts[nom] = model.create_voice_clone_prompt(
+                ref_audio=s["audio"], ref_text=s["transcription"] or None,
+                x_vector_only_mode=not s["transcription"])[0]
+        except Exception as e:  # noqa: BLE001
+            if nom is None:
+                raise
+            bus.log(f"⚠ Voix « {nom} » inutilisable ({e}) — voix principale à la place.")
+    sources = {k: v for k, v in sources.items() if k in prompts}
+    try:
+        duree = sf.info(ref).duration
+        if duree > 20:
+            bus.log(f"💡 Voix de référence de {duree:.0f} s : un extrait de 10 à 15 s "
+                    "réduirait la mémoire utilisée et permettrait des lots plus grands.")
+    except Exception:  # noqa: BLE001
+        pass
+    return prompts, sources
+
+
+def controle_qualite(generer, resultats, chunks, sr, langue, lot, cache, device,
+                     bus, stop_event):
+    """Fait écouter chaque phrase par Whisper, compare au texte et régénère
+    les phrases douteuses (au plus QC_TENTATIVES fois), en gardant la
+    meilleure version. Renvoie {indice: score}."""
+    try:
+        pipe = charger_whisper(cache, device, bus)
+    except Exception as e:  # noqa: BLE001
+        bus.log(f"⚠ Contrôle qualité impossible : Whisper n'a pas pu être chargé ({e}).")
+        return {}
+    bus.status("Contrôle qualité (Whisper)…")
+    indices = [k for k in range(len(resultats)) if resultats[k] is not None]
+    t = time.time()
+    transcrits = transcrire(pipe, [resultats[k] for k in indices], sr, langue,
+                            taille_lot=min(lot, 16))
+    scores = {k: score_conformite(chunks[k][0], tr) for k, tr in zip(indices, transcrits)}
+    douteux = [k for k in indices if scores[k] < SEUIL_QC]
+    bus.log(f"🔎 Contrôle qualité : {len(indices)} phrases écoutées en "
+            f"{time.time() - t:.0f} s, {len(douteux)} à reprendre.")
+
+    for essai in range(1, QC_TENTATIVES + 1):
+        if not douteux or stop_event.is_set():
+            break
+        bus.log(f"   Nouvelle génération de {len(douteux)} phrase(s) (essai {essai}/{QC_TENTATIVES})…")
+        nouveaux = {}
+        for b0 in range(0, len(douteux), lot):
+            groupe = douteux[b0:b0 + lot]
+            try:
+                wavs, _ = generer(groupe)
+                nouveaux.update(zip(groupe, wavs))
+            except Exception as e:  # noqa: BLE001
+                bus.log(f"   ❌ Régénération impossible : {e}")
+        if not nouveaux:
+            break
+        cles = list(nouveaux)
+        trs = transcrire(pipe, [nouveaux[k] for k in cles], sr, langue, taille_lot=min(lot, 16))
+        for k, tr in zip(cles, trs):
+            s = score_conformite(chunks[k][0], tr)
+            if s > scores[k]:
+                resultats[k], scores[k] = nouveaux[k], s
+        douteux = [k for k in douteux if scores[k] < SEUIL_QC]
+
+    if douteux:
+        liste = ", ".join(str(k + 1) for k in douteux[:25]) + ("…" if len(douteux) > 25 else "")
+        bus.log(f"   ⚠ {len(douteux)} phrase(s) encore douteuse(s) : n° {liste}. "
+                "À écouter, ou à reprendre avec « Corriger des phrases ».")
+    else:
+        bus.log("   ✓ Toutes les phrases correspondent au texte.")
+    return scores
+
+
 def worker_generation(config, bus, stop_event, cache):
-    """Fonction exécutée dans le thread de travail : lecture, nettoyage,
-    découpage, génération, assemblage et export."""
+    """Fonction exécutée dans le thread de travail : lecture, découpage,
+    génération par lots, contrôle qualité, assemblage et exports."""
     mods = precharger_modules()           # renvoie le cache (import déjà fait)
     np = mods["np"]
-    sf = mods["sf"]
-    resample_poly = mods["resample_poly"]
 
     t0 = time.time()
 
@@ -646,12 +1263,16 @@ def worker_generation(config, bus, stop_event, cache):
         # --- Lecture + découpage ---
         bus.status("Lecture et préparation du texte…")
         bus.log(f"Lecture du fichier : {os.path.basename(txt)}")
-        texte_brut = lire_fichier_texte(txt)
-
-        chunks_finaux, stats = construire_chunks(texte_brut, config["max_chars"])
+        plan = construire_plan(lire_paragraphes(txt), config["max_chars"],
+                               par_chapitres=bool(config.get("livre")))
+        chunks_finaux, stats = plan["chunks"], plan["stats"]
         bus.log(f"Texte découpé en {stats['nb_chunks']} chunks "
                 f"(min {stats['min']} / max {stats['max']} / moy {stats['moyenne']} car.)")
         bus.log(f"Fins de paragraphe détectées : {stats['nb_fin_para']}")
+        if stats["voix"]:
+            bus.log(f"Voix balisées : {', '.join(stats['voix'])}")
+        if config.get("livre"):
+            bus.log(f"Chapitres détectés : {stats['nb_chapitres']}")
 
         if not chunks_finaux:
             bus.erreur("Aucun contenu exploitable après nettoyage du texte.")
@@ -663,47 +1284,19 @@ def worker_generation(config, bus, stop_event, cache):
         torch = mods["torch"]
         sur_gpu = torch.cuda.is_available() and device.startswith("cuda")
 
-        # --- Empreinte vocale : calculée UNE SEULE FOIS ---
-        # Avant : à chaque chunk, le wav de référence était relu, rééchantillonné
-        # et ré-encodé (tokenizer audio + encodeur de locuteur).
-        ref_text = (config.get("ref_text") or "").strip()
-        bus.status("Analyse de la voix de référence…")
+        # --- Empreintes vocales : calculées UNE SEULE FOIS par voix ---
+        bus.status("Analyse des voix…")
         try:
-            prompt_voix = model.create_voice_clone_prompt(
-                ref_audio=ref,
-                ref_text=ref_text or None,
-                x_vector_only_mode=not ref_text,
-            )
-        except Exception as e:
+            prompts, sources = preparer_voix(model, config, stats["voix"], bus, cache, device)
+        except Exception as e:  # noqa: BLE001
             bus.erreur(f"Analyse de la voix de référence impossible : {e}")
             return
-        if not ref_text:
+        if not sources[None]["transcription"]:
             bus.log("⚠ Transcription de référence vide — clonage sur la seule "
                     "empreinte du locuteur (moins fidèle).")
-
-        def plafond_trames(textes):
-            # Le modèle produit 12,5 trames par seconde, soit ~0,6 trame par
-            # caractère en français. Plafond à ~4x cette valeur : une phrase
-            # qui « boucle » (le modèle ne s'arrête pas) ne peut plus retenir
-            # tout son lot jusqu'à la limite d'origine de 2 048 trames (2 min 44).
-            return int(40 + 2.5 * max(len(t) for t in textes))
-
-        def generer(textes):
-            # Le modèle Base ignore toute consigne de ton : seule la voix de
-            # référence compte. On ne transmet donc plus `instruct`.
-            plafond = plafond_trames(textes)
-            wavs, sr = model.generate_voice_clone(
-                text=textes,
-                language=config["language"],
-                voice_clone_prompt=prompt_voix,
-                max_new_tokens=plafond,
-            )
-            limite = 0.95 * plafond / 12.5 * sr
-            for t, w in zip(textes, wavs):
-                if len(w) >= limite:
-                    bus.log(f"   ⚠ Phrase coupée à la durée maximale (le modèle a "
-                            f"probablement bouclé) : « {t[:50]}… » — à vérifier à l'écoute.")
-            return wavs, sr
+        voix_par_chunk = [v if v in prompts else None for v in plan["voix"]]
+        generer = fabriquer_generateur(model, prompts, voix_par_chunk, chunks_finaux,
+                                       config["language"], bus)
 
         # --- Boucle de génération PAR LOTS ---
         # La génération est autorégressive : à une phrase par appel, le GPU
@@ -748,10 +1341,11 @@ def worker_generation(config, bus, stop_event, cache):
                     chunk, est_fin_para = chunks_finaux[k]
                     apercu = chunk[:55] + "…" if len(chunk) > 55 else chunk
                     marque = " ¶" if est_fin_para else ""
-                    bus.log(f"[{k + 1:>4}/{n}] ({len(chunk):>3} car.){marque} : {apercu}")
+                    qui = f" [{voix_par_chunk[k]}]" if voix_par_chunk[k] else ""
+                    bus.log(f"[{k + 1:>4}/{n}] ({len(chunk):>3} car.){marque}{qui} : {apercu}")
 
                 try:
-                    wavs, sr = generer([chunks_finaux[k][0] for k in groupe])
+                    wavs, sr = generer(groupe)
                     for k, w in zip(groupe, wavs):
                         resultats[k] = w
                     sr_final = sr
@@ -766,7 +1360,7 @@ def worker_generation(config, bus, stop_event, cache):
                             torch.cuda.empty_cache()
                         for k in groupe:
                             try:
-                                wavs, sr = generer([chunks_finaux[k][0]])
+                                wavs, sr = generer([k])
                                 resultats[k] = wavs[0]
                                 sr_final = sr
                             except Exception as e2:
@@ -806,125 +1400,154 @@ def worker_generation(config, bus, stop_event, cache):
         bus.progress(traites, n)
         bus.log(f"Génération : {time.time() - t_gen:.0f} s pour {traites} morceaux.")
 
+        # --- Contrôle qualité (optionnel) ---
+        scores = {}
+        if config.get("qc") and not stop_event.is_set():
+            scores = controle_qualite(generer, resultats, chunks_finaux, sr_final,
+                                      config["language"], lot, cache, device,
+                                      bus, stop_event)
+
         # --- Remise dans l'ordre du texte ---
         # Après un arrêt, on ne garde que la partie continue depuis le début :
         # pas de trou au milieu du rendu partiel.
         limite = n
-        if stop_event.is_set():
+        arret = stop_event.is_set()
+        if arret:
             limite = next((k for k in range(n) if not fait[k]), n)
-        audios = []
-        for k in range(limite):
-            if resultats[k] is None:
-                continue
-            chunk, est_fin_para = chunks_finaux[k]
-            audios.append(normaliser_peak(resultats[k], config["target_peak"]))
-            dur = duree_silence_apres(
-                chunk, est_fin_para,
-                config["sil_virgule"], config["sil_point"], config["sil_para"],
-            )
-            audios.append(np.zeros(int(dur * sr_final), dtype=np.float32))
-        resultats = None
         if sur_gpu:
             torch.cuda.empty_cache()
         gc.collect()
 
-        # --- Assemblage et sauvegarde ---
-        if not audios:
+        if not any(resultats[k] is not None for k in range(limite)):
             bus.erreur("Aucun audio n'a pu être généré.")
             return
 
-        arret = stop_event.is_set()
-        bus.status("Assemblage final…")
-        bus.log(f"Assemblage… ({echecs} échec(s) sur {n} chunks)")
-
-        audio_complet = np.concatenate(audios).astype(np.float32)
-
-        # Construction du nom de fichier
+        # --- Nom des fichiers ---
         base = config["output_base"].strip() or "rendu"
         suffixe = "-partiel" if arret else ""
         if config["horodater"]:
-            horod = datetime.now().strftime("%Y%m%d-%H%M%S")
-            nom = f"{base}-{horod}{suffixe}.wav"
-            horod_str = horod
+            nom = f"{base}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{suffixe}.wav"
         else:
             nom = f"{base}{suffixe}.wav"
-            horod_str = None
-
         out_dir = config["output_dir"].strip() or os.path.dirname(txt) or "."
         os.makedirs(out_dir, exist_ok=True)
-        chemin_wav = os.path.join(out_dir, nom)
 
-        sf.write(chemin_wav, audio_complet, sr_final)
-        duree = len(audio_complet) / sr_final
-        bus.log(f"🎭 Fichier natif ({sr_final} Hz) : {os.path.abspath(chemin_wav)}")
-        bus.log(f"   Durée : {int(duree // 60)} min {int(duree % 60)} sec")
+        projet = {
+            "version": 1,
+            "texte_source": txt,
+            "langue": config["language"],
+            "voix": {("" if k is None else k): v for k, v in sources.items()},
+            "reglages": {cle: config.get(cle) for cle in (
+                "sil_virgule", "sil_point", "sil_para", "target_peak", "freq_supp",
+                "export_mp3", "mp3_bitrate", "mp3_mono", "mp3_source", "ffmpeg_path",
+                "srt", "livre", "livre_titre", "livre_auteur", "livre_couverture")},
+            "sortie": {"wav": os.path.join(out_dir, nom)},
+            "titres": plan["titres"],
+            "limite": limite,
+            "chunks": [{"texte": c, "fin_para": fp, "voix": voix_par_chunk[k] or "",
+                        "chapitre": plan["chapitre"][k],
+                        "score": round(scores[k], 3) if k in scores else None}
+                       for k, (c, fp) in enumerate(chunks_finaux)],
+        }
+        if config.get("livre") and not projet["reglages"].get("livre_titre"):
+            projet["reglages"]["livre_titre"] = base
 
-        fichiers = [chemin_wav]
-        chemin_resample = None
+        # --- Assemblage et exports ---
+        bus.status("Assemblage final…")
+        bus.log(f"Assemblage… ({echecs} échec(s) sur {n} chunks)")
+        res = assembler_et_exporter(projet, resultats, sr_final, limite, bus)
+        if res is None:
+            bus.erreur("Aucun audio n'a pu être généré.")
+            return
 
-        # --- Version rééchantillonnée (optionnelle) ---
-        freq_supp = config["freq_supp"]
-        if freq_supp and freq_supp != sr_final:
-            fs_cible = int(freq_supp)
-            d = gcd(fs_cible, sr_final)
-            up, down = fs_cible // d, sr_final // d
-            bus.log(f"   Rééchantillonnage {sr_final} → {fs_cible} Hz (ratio {up}/{down})…")
-            audio_rs = resample_poly(audio_complet, up=up, down=down).astype(np.float32)
-            if config["horodater"]:
-                nom_rs = f"{base}-{horod_str}{suffixe}-{fs_cible}.wav"
-            else:
-                nom_rs = f"{base}{suffixe}-{fs_cible}.wav"
-            chemin_resample = os.path.join(out_dir, nom_rs)
-            sf.write(chemin_resample, audio_rs, fs_cible)
-            bus.log(f"   ✓ Version {fs_cible} Hz : {os.path.abspath(chemin_resample)}")
-            fichiers.append(chemin_resample)
+        dossier = None
+        if config.get("garder_morceaux", True):
+            try:
+                dossier = sauver_projet(projet, resultats, sr_final)
+                bus.log(f"🧩 Morceaux conservés pour correction : {dossier}")
+            except Exception as e:  # noqa: BLE001
+                bus.log(f"   ⚠ Morceaux non conservés : {e}")
 
-        # --- Export MP3 (optionnel, via ffmpeg) ---
-        if config["export_mp3"]:
-            ffmpeg = trouver_ffmpeg(config.get("ffmpeg_path"))
-            if ffmpeg is None:
-                bus.log("   ⚠️  ffmpeg introuvable (PATH + emplacements usuels) — "
-                        "export MP3 ignoré. Indique son chemin dans l'onglet Export.")
-            else:
-                src = config["mp3_source"]
-                if src == "resample" and chemin_resample:
-                    source_mp3 = chemin_resample
-                elif src == "natif":
-                    source_mp3 = chemin_wav
-                else:
-                    source_mp3 = chemin_resample if chemin_resample else chemin_wav
-
-                nom_mp3 = os.path.splitext(source_mp3)[0] + ".mp3"
-                cmd = [
-                    ffmpeg, "-y", "-i", source_mp3,
-                    "-c:a", "libmp3lame", "-b:a", config["mp3_bitrate"],
-                    "-ac", "1" if config["mp3_mono"] else "2",
-                    nom_mp3,
-                ]
-                canal = "mono" if config["mp3_mono"] else "stéréo"
-                bus.log(f"   Encodage MP3 ({config['mp3_bitrate']}, {canal})…")
-                try:
-                    subprocess.run(cmd, check=True,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    bus.log(f"   ✓ MP3 : {os.path.abspath(nom_mp3)}")
-                    fichiers.append(nom_mp3)
-                except subprocess.CalledProcessError as e:
-                    bus.log(f"   ❌ Erreur ffmpeg (code {e.returncode}).")
-                    if e.stderr:
-                        bus.log(e.stderr.decode("utf-8", errors="replace")[-400:])
-
-        elapsed = time.time() - t0
         bus.termine({
-            "fichiers": fichiers,
-            "principal": chemin_wav,
+            "fichiers": res["fichiers"],
+            "principal": res["principal"],
             "dossier": os.path.abspath(out_dir),
-            "duree_audio": duree,
-            "duree_calcul": elapsed,
+            "duree_audio": res["duree"],
+            "duree_calcul": time.time() - t0,
             "echecs": echecs,
             "total": n,
             "partiel": arret,
+            "projet": dossier,
         })
 
+    except Exception as e:
+        import traceback
+        bus.log(traceback.format_exc())
+        bus.erreur(str(e))
+
+
+def worker_correction(dossier, indices, config, bus, stop_event, cache):
+    """Régénère quelques phrases d'un rendu conservé, puis refait
+    l'assemblage et toutes les sorties (WAV, MP3, SRT, M4B…)."""
+    t0 = time.time()
+    try:
+        projet, audios = charger_projet(dossier)
+        chunks = [(c["texte"], c["fin_para"]) for c in projet["chunks"]]
+        sr = int(projet.get("sr") or 24000)
+        model, device = charger_modele(config, bus, cache)
+
+        voix_projet = {(k or None): v for k, v in projet["voix"].items()}
+        utiles = {projet["chunks"][k]["voix"] or None for k in indices}
+        prompts = {}
+        for nom in utiles | {None}:
+            s = voix_projet.get(nom) or voix_projet[None]
+            prompts[nom] = model.create_voice_clone_prompt(
+                ref_audio=s["audio"], ref_text=s["transcription"] or None,
+                x_vector_only_mode=not s["transcription"])[0]
+        voix_par_chunk = [(c["voix"] or None) if (c["voix"] or None) in prompts else None
+                          for c in projet["chunks"]]
+        generer = fabriquer_generateur(model, prompts, voix_par_chunk, chunks,
+                                       projet["langue"], bus)
+
+        lot = max(1, int(config.get("taille_lot", TAILLE_LOT) or 1))
+        bus.status("Correction en cours…")
+        bus.log(f"✎ Nouvelle génération de {len(indices)} phrase(s)…")
+        faits, echecs = 0, 0
+        for b0 in range(0, len(indices), lot):
+            if stop_event.is_set():
+                break
+            groupe = indices[b0:b0 + lot]
+            for k in groupe:
+                bus.log(f"[{k + 1:>4}] {chunks[k][0][:70]}")
+            try:
+                wavs, sr = generer(groupe)
+                for k, w in zip(groupe, wavs):
+                    audios[k] = w
+                    projet["chunks"][k]["score"] = None
+            except Exception as e:  # noqa: BLE001
+                echecs += len(groupe)
+                bus.log(f"   ❌ {e}")
+            faits += len(groupe)
+            bus.progress(faits, len(indices))
+
+        bus.status("Assemblage final…")
+        res = assembler_et_exporter(projet, audios, sr,
+                                    projet.get("limite", len(chunks)), bus)
+        if res is None:
+            bus.erreur("Aucun audio à assembler.")
+            return
+        sauver_projet(projet, audios, sr)
+        bus.termine({
+            "fichiers": res["fichiers"],
+            "principal": res["principal"],
+            "dossier": os.path.dirname(os.path.abspath(res["principal"])),
+            "duree_audio": res["duree"],
+            "duree_calcul": time.time() - t0,
+            "echecs": echecs,
+            "total": len(indices),
+            "partiel": stop_event.is_set(),
+            "projet": dossier,
+        })
     except Exception as e:
         import traceback
         bus.log(traceback.format_exc())
@@ -1735,6 +2358,7 @@ class TTSStudio(tk.Tk):
         self.model_cache = {}            # persiste le modèle entre les rendus
         self.dernier_dossier = None
         self.dernier_fichier = None
+        self.dernier_projet = None       # dossier « _projet » du dernier rendu
         # Montage vidéo : thread et signal d'arrêt distincts de ceux du TTS
         self.stop_video = threading.Event()
         self.worker_video = None
@@ -1811,6 +2435,15 @@ class TTSStudio(tk.Tk):
         self.v_language = tk.StringVar(value="French")
         self.v_max_chars = tk.IntVar(value=350)
         self.v_taille_lot = tk.IntVar(value=TAILLE_LOT)
+        # --- Livre audio, qualité, dialogues ---
+        self.v_qc = tk.BooleanVar(value=False)
+        self.v_srt = tk.BooleanVar(value=True)
+        self.v_dossier_voix = tk.StringVar()
+        self.v_livre = tk.BooleanVar(value=False)
+        self.v_livre_titre = tk.StringVar()
+        self.v_livre_auteur = tk.StringVar()
+        self.v_livre_couverture = tk.StringVar()
+        self.v_garder_morceaux = tk.BooleanVar(value=True)
         self.v_sil_virgule = tk.DoubleVar(value=0.15)
         self.v_sil_point = tk.DoubleVar(value=0.40)
         self.v_sil_para = tk.DoubleVar(value=0.70)
@@ -1876,6 +2509,7 @@ class TTSStudio(tk.Tk):
         nb.pack(fill="both", expand=True)
         self._onglet_entrees(nb)
         self._onglet_voix(nb)
+        self._onglet_livre(nb)
         self._onglet_export(nb)
         self._onglet_video(nb)
         self._onglet_fusion(nb)
@@ -1945,8 +2579,16 @@ class TTSStudio(tk.Tk):
         b.grid(row=r, column=2, padx=(6, 0))
         r += 1
 
-        ttk.Label(f, text="Transcription EXACTE de la voix de référence").grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        ligne = ttk.Frame(f)
+        ligne.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(12, 2))
+        ttk.Label(ligne, text="Transcription EXACTE de la voix de référence").pack(side="left")
+        self.btn_transcrire = ttk.Button(ligne, text="🎧 Transcrire automatiquement",
+                                         command=self._transcrire_ref)
+        self.btn_transcrire.pack(side="right")
+        Tooltip(self.btn_transcrire,
+                "Whisper écoute la voix de référence et remplit ce champ.\n"
+                "Relisez le résultat : une transcription exacte améliore le clonage.\n"
+                "Premier usage : téléchargement du modèle Whisper (~1,6 Go).")
         r += 1
         self.txt_ref = tk.Text(f, height=5, wrap="word", font=("Segoe UI", 10),
                                relief="solid", borderwidth=1, padx=6, pady=4)
@@ -2027,6 +2669,223 @@ class TTSStudio(tk.Tk):
         ttk.Label(f, text="Fréquence supplémentaire (Hz)").grid(row=r, column=0, sticky="w", pady=(8, 4))
         ttk.Combobox(f, textvariable=self.v_freq_supp, values=["Aucune", "44100", "48000"],
                      state="readonly", width=10).grid(row=r, column=1, sticky="e", pady=(8, 4))
+
+    def _onglet_livre(self, nb):
+        f = ttk.Frame(nb, padding=14)
+        nb.add(f, text="  Livre & Qualité  ")
+        f.columnconfigure(1, weight=1)
+        r = 0
+
+        # --- Qualité ---
+        ttk.Label(f, text="Qualité", style="TLabelframe.Label").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        cb = ttk.Checkbutton(f, text="Contrôle qualité automatique (Whisper)",
+                             variable=self.v_qc)
+        cb.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        Tooltip(cb, "Après la génération, Whisper réécoute chaque phrase et la compare\n"
+                    "au texte. Les phrases mal lues (mots sautés, répétitions, boucles)\n"
+                    "sont régénérées automatiquement, deux fois au plus.\n"
+                    "Coût : environ 10 à 20 % de temps en plus, ~1,6 Go de VRAM.")
+        r += 1
+        cb = ttk.Checkbutton(f, text="Créer les sous-titres (.srt)", variable=self.v_srt)
+        cb.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        Tooltip(cb, "Fichier de sous-titres synchronisés, à joindre à une vidéo YouTube.")
+        r += 1
+
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=12)
+        r += 1
+
+        # --- Dialogues ---
+        ttk.Label(f, text="Dialogues à plusieurs voix", style="TLabelframe.Label").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        ttk.Label(f, text="Dossier des voix").grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        r += 1
+        e = ttk.Entry(f, textvariable=self.v_dossier_voix)
+        e.grid(row=r, column=0, columnspan=2, sticky="ew")
+        Tooltip(e, "Dans le texte, commencez un paragraphe par [Marie] pour le faire lire\n"
+                   "avec Marie.wav de ce dossier (transcription dans Marie.txt, créée\n"
+                   "automatiquement par Whisper si elle manque). Sans balise ou avec\n"
+                   "[Narrateur] : voix principale de l'onglet Entrées.")
+        ttk.Button(f, text="Parcourir…", command=self._choisir_dossier_voix).grid(
+            row=r, column=2, padx=(6, 0))
+        r += 1
+        ttk.Label(f, text="Exemple :  [Marie] Bonjour, dit-elle.   →   lu avec Marie.wav",
+                  style="Sub.TLabel").grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        r += 1
+
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=12)
+        r += 1
+
+        # --- Livre audio ---
+        ttk.Label(f, text="Livre audio", style="TLabelframe.Label").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        cb = ttk.Checkbutton(f, text="Créer un livre audio M4B (un chapitre par titre du document)",
+                             variable=self.v_livre)
+        cb.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        Tooltip(cb, "Les chapitres suivent les titres du document : styles « Titre 1 »\n"
+                    "de Word, ou lignes « # » en Markdown. Produit aussi un fichier\n"
+                    "-chapitres.txt prêt à coller dans une description YouTube.")
+        r += 1
+        ttk.Label(f, text="Titre").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_livre_titre).grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
+        r += 1
+        ttk.Label(f, text="Auteur").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_livre_auteur).grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
+        r += 1
+        ttk.Label(f, text="Couverture").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_livre_couverture).grid(row=r, column=1, sticky="ew", pady=3)
+        ttk.Button(f, text="Parcourir…", command=self._choisir_couverture).grid(
+            row=r, column=2, padx=(6, 0), pady=3)
+        r += 1
+
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=12)
+        r += 1
+
+        # --- Correction ---
+        ttk.Label(f, text="Correction", style="TLabelframe.Label").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        cb = ttk.Checkbutton(f, text="Conserver les morceaux pour pouvoir corriger des phrases",
+                             variable=self.v_garder_morceaux)
+        cb.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        Tooltip(cb, "Chaque phrase est gardée dans un dossier « …_projet » à côté du rendu.\n"
+                    "Vous pourrez ensuite régénérer une phrase sans tout relancer.")
+        r += 1
+        self.btn_corriger = ttk.Button(f, text="✎ Corriger des phrases…",
+                                       command=self._ouvrir_correction)
+        self.btn_corriger.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    def _choisir_dossier_voix(self):
+        chemin = filedialog.askdirectory(title="Dossier contenant les voix (Nom.wav)")
+        if chemin:
+            self.v_dossier_voix.set(chemin)
+
+    def _choisir_couverture(self):
+        chemin = filedialog.askopenfilename(
+            title="Choisir la couverture du livre audio",
+            filetypes=[("Images", "*.jpg *.jpeg *.png"), ("Tous les fichiers", "*.*")])
+        if chemin:
+            self.v_livre_couverture.set(chemin)
+
+    # ------------------------------------------------------- transcription
+    def _transcrire_ref(self):
+        if self.taches:
+            return
+        if not self.pret:
+            messagebox.showinfo("Patiente", "Les bibliothèques sont encore en cours de chargement.")
+            return
+        chemin = self.v_ref_audio.get().strip()
+        if not chemin or not os.path.exists(chemin):
+            messagebox.showwarning("Voix manquante", "Sélectionne d'abord une voix de référence.")
+            return
+        self.taches.add("transcription")
+        self._maj_boutons()
+        self._log("🎧 Transcription de la voix de référence par Whisper…")
+        threading.Thread(target=worker_transcription,
+                         args=(chemin, self.v_language.get(), self.v_device.get(),
+                               self.bus, self.model_cache),
+                         daemon=True).start()
+
+    # ---------------------------------------------------------- correction
+    def _ouvrir_correction(self):
+        if self.taches:
+            return
+        dossier = self.dernier_projet
+        if not dossier or not os.path.isfile(os.path.join(dossier, "projet.json")):
+            chemin = filedialog.askopenfilename(
+                title="Ouvrir le projet d'un rendu (dossier …_projet)",
+                filetypes=[("Projet de rendu", "projet.json")])
+            if not chemin:
+                return
+            dossier = os.path.dirname(chemin)
+        try:
+            with open(os.path.join(dossier, "projet.json"), encoding="utf-8") as fp:
+                projet = json.load(fp)
+        except Exception as e:
+            messagebox.showerror("Correction", f"Projet illisible :\n{e}")
+            return
+
+        fen = tk.Toplevel(self)
+        fen.title("Corriger des phrases — " + os.path.basename(projet["sortie"]["wav"]))
+        fen.geometry("980x560")
+        fen.transient(self)
+        ttk.Label(fen, padding=(12, 10, 12, 4),
+                  text="Sélectionnez les phrases à refaire (Ctrl ou Maj pour en choisir plusieurs). "
+                       "En rouge : phrases jugées douteuses par le contrôle qualité.").pack(anchor="w")
+        cadre = ttk.Frame(fen, padding=(12, 0, 12, 0))
+        cadre.pack(fill="both", expand=True)
+        arbre = ttk.Treeview(cadre, columns=("n", "voix", "score", "texte"),
+                             show="headings", selectmode="extended")
+        for col, titre, larg in (("n", "N°", 50), ("voix", "Voix", 90),
+                                 ("score", "Contrôle", 70), ("texte", "Texte", 720)):
+            arbre.heading(col, text=titre)
+            arbre.column(col, width=larg, stretch=(col == "texte"),
+                         anchor="w" if col == "texte" else "center")
+        defil = ttk.Scrollbar(cadre, orient="vertical", command=arbre.yview)
+        arbre.configure(yscrollcommand=defil.set)
+        arbre.pack(side="left", fill="both", expand=True)
+        defil.pack(side="right", fill="y")
+        arbre.tag_configure("douteux", foreground="#b03030")
+        for k, c in enumerate(projet["chunks"]):
+            score = c.get("score")
+            arbre.insert("", "end", iid=str(k), values=(
+                k + 1, c.get("voix") or "—",
+                "" if score is None else f"{score:.0%}", c["texte"]),
+                tags=("douteux",) if (score is not None and score < SEUIL_QC) else ())
+
+        def selection():
+            return sorted(int(i) for i in arbre.selection())
+
+        def ecouter():
+            sel = selection()
+            if sel:
+                c = projet["chunks"][sel[0]]
+                chemin = os.path.join(dossier, "morceaux", c.get("fichier") or "")
+                if c.get("fichier") and os.path.exists(chemin):
+                    self._ouvrir_chemin(chemin)
+
+        def douteuses():
+            arbre.selection_set([str(k) for k, c in enumerate(projet["chunks"])
+                                 if c.get("score") is not None and c["score"] < SEUIL_QC])
+
+        def regenerer():
+            sel = selection()
+            if not sel:
+                messagebox.showinfo("Correction", "Sélectionnez au moins une phrase.", parent=fen)
+                return
+            fen.destroy()
+            self._lancer_correction(dossier, sel)
+
+        bas = ttk.Frame(fen, padding=12)
+        bas.pack(fill="x")
+        ttk.Button(bas, text="▶ Écouter", command=ecouter).pack(side="left")
+        ttk.Button(bas, text="Sélectionner les douteuses", command=douteuses).pack(side="left", padx=6)
+        ttk.Button(bas, text="Fermer", command=fen.destroy).pack(side="right")
+        ttk.Button(bas, text="🔁 Régénérer la sélection", style="Accent.TButton",
+                   command=regenerer).pack(side="right", padx=6)
+        arbre.bind("<Double-1>", lambda _e: ecouter())
+
+    def _lancer_correction(self, dossier, indices):
+        if self.taches or not self.pret:
+            return
+        config = self._construire_config()
+        self.stop_event.clear()
+        self.taches.add("tts")
+        self._maj_boutons()
+        self.progress.config(value=0, maximum=max(1, len(indices)))
+        self.t_debut = time.time()
+        self._tic_chrono()
+        self._log("─" * 50)
+        self._log(f"✎ Correction de {len(indices)} phrase(s) : n° "
+                  + ", ".join(str(k + 1) for k in indices[:30]))
+        self.worker = threading.Thread(
+            target=worker_correction,
+            args=(dossier, indices, config, self.bus, self.stop_event, self.model_cache),
+            daemon=True)
+        self.worker.start()
 
     def _onglet_export(self, nb):
         f = ttk.Frame(nb, padding=14)
@@ -3075,16 +3934,28 @@ class TTSStudio(tk.Tk):
             messagebox.showwarning("Aperçu", "Sélectionne d'abord un fichier texte valide.")
             return
         try:
-            texte = lire_fichier_texte(chemin)
-            _, stats = construire_chunks(texte, self._int(self.v_max_chars, 350))
+            plan = construire_plan(lire_paragraphes(chemin), self._int(self.v_max_chars, 350),
+                                   par_chapitres=self.v_livre.get())
         except Exception as e:
             messagebox.showerror("Aperçu", f"Erreur de lecture :\n{e}")
             return
+        stats = plan["stats"]
         self._log("─" * 50)
         self._log(f"APERÇU — {os.path.basename(chemin)}")
         self._log(f"Chunks : {stats['nb_chunks']}  |  "
                   f"min {stats['min']} / max {stats['max']} / moy {stats['moyenne']} car.")
         self._log(f"Fins de paragraphe : {stats['nb_fin_para']}")
+        if self.v_livre.get():
+            self._log(f"Chapitres ({stats['nb_chapitres']}) : " + " | ".join(plan["titres"][:12])
+                      + (" …" if len(plan["titres"]) > 12 else ""))
+        if stats["voix"]:
+            dossier = self.v_dossier_voix.get().strip()
+            for nom in stats["voix"]:
+                n = sum(1 for v in plan["voix"] if v == nom)
+                trouve = trouver_voix(dossier, nom)
+                etat = (f"✓ {os.path.basename(trouve[0])}" if trouve
+                        else "✗ introuvable : la voix principale la remplacera")
+                self._log(f"Voix [{nom}] : {n} morceau(x) — {etat}")
         extrait = stats["texte_nettoye"][:600]
         self._log("Texte nettoyé (extrait) :")
         self._log(extrait + ("…" if len(stats["texte_nettoye"]) > 600 else ""))
@@ -3170,6 +4041,14 @@ class TTSStudio(tk.Tk):
             "horodater": self.v_horodater.get(),
             "max_chars": self._int(self.v_max_chars, 350),
             "taille_lot": max(1, self._int(self.v_taille_lot, TAILLE_LOT)),
+            "qc": self.v_qc.get(),
+            "srt": self.v_srt.get(),
+            "dossier_voix": self.v_dossier_voix.get().strip(),
+            "livre": self.v_livre.get(),
+            "livre_titre": self.v_livre_titre.get().strip(),
+            "livre_auteur": self.v_livre_auteur.get().strip(),
+            "livre_couverture": self.v_livre_couverture.get().strip(),
+            "garder_morceaux": self.v_garder_morceaux.get(),
             "sil_virgule": self._float(self.v_sil_virgule, 0.15),
             "sil_point": self._float(self.v_sil_point, 0.40),
             "sil_para": self._float(self.v_sil_para, 0.70),
@@ -3206,6 +4085,14 @@ class TTSStudio(tk.Tk):
                     "La transcription de la voix de référence est vide.\n"
                     "Le clonage sera de moins bonne qualité.\n\nContinuer quand même ?"):
                 return
+
+        if config["livre"] and config["livre_couverture"] and not os.path.isfile(config["livre_couverture"]):
+            messagebox.showwarning("Couverture introuvable",
+                                   "L'image de couverture n'existe pas : le livre sera créé sans couverture.")
+        if config["dossier_voix"] and not os.path.isdir(config["dossier_voix"]):
+            messagebox.showwarning("Dossier des voix introuvable",
+                                   "Le dossier des voix n'existe pas : toutes les répliques "
+                                   "seront lues avec la voix principale.")
 
         self.stop_event.clear()
         self.taches.add("tts")
@@ -3265,9 +4152,27 @@ class TTSStudio(tk.Tk):
             self._log(f"❌ ERREUR : {msg[1]}")
             self.v_progress.set("Erreur.")
             messagebox.showerror("Erreur", msg[1])
+        elif type_ == "transcription":
+            texte, duree = msg[1], msg[2]
+            self.taches.discard("transcription")
+            self._maj_boutons()
+            self.txt_ref.delete("1.0", "end")
+            self.txt_ref.insert("1.0", texte)
+            self.v_progress.set("Transcription terminée.")
+            self._log(f"   ✓ Transcription ({duree:.0f} s d'audio) : relisez-la et corrigez si besoin.")
+            if duree > 20:
+                self._log("   💡 Un extrait de 10 à 15 s suffit au clonage et laisse "
+                          "plus de mémoire pour de grands lots.")
+        elif type_ == "transcription_erreur":
+            self.taches.discard("transcription")
+            self._maj_boutons()
+            self.v_progress.set("Transcription impossible.")
+            self._log(f"❌ Transcription impossible : {msg[1]}")
+            messagebox.showerror("Transcription", msg[1])
         elif type_ == "done":
             d = msg[1]
             self._fin_generation()
+            self.dernier_projet = d.get("projet") or self.dernier_projet
             self.dernier_dossier = d["dossier"]
             self.dernier_fichier = d["principal"]
             self.btn_ouvrir.config(state="normal")
@@ -3373,6 +4278,9 @@ class TTSStudio(tk.Tk):
         self.btn_video.config(state=etat)
         self.btn_fusion.config(state=etat)
         self.btn_generer.config(state="normal" if (self.pret and not occupe) else "disabled")
+        for nom in ("btn_transcrire", "btn_corriger"):
+            if hasattr(self, nom):
+                getattr(self, nom).config(state=etat)
         self.btn_stop.config(state="normal" if occupe else "disabled")
 
     # ---------------------------------------------------------------- sortie
@@ -3446,6 +4354,14 @@ class TTSStudio(tk.Tk):
         self.v_horodater.set(d.get("horodater", False))
         self.v_max_chars.set(d.get("max_chars", 350))
         self.v_taille_lot.set(TAILLE_LOT)      # la constante en tête de fichier prime
+        self.v_qc.set(d.get("qc", False))
+        self.v_srt.set(d.get("srt", True))
+        self.v_dossier_voix.set(d.get("dossier_voix", ""))
+        self.v_livre.set(d.get("livre", False))
+        self.v_livre_titre.set(d.get("livre_titre", ""))
+        self.v_livre_auteur.set(d.get("livre_auteur", ""))
+        self.v_livre_couverture.set(d.get("livre_couverture", ""))
+        self.v_garder_morceaux.set(d.get("garder_morceaux", True))
         self.v_sil_virgule.set(d.get("sil_virgule", 0.15))
         self.v_sil_point.set(d.get("sil_point", 0.40))
         self.v_sil_para.set(d.get("sil_para", 0.70))

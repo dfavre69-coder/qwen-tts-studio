@@ -15,6 +15,10 @@ dans ce dépôt :
     (acceleration_qwen.py reproduit la logique de tirage température /
     top-k / top-p de transformers)
 
+  - Whisper large-v3-turbo (OpenAI), modèle de reconnaissance vocale
+    téléchargé au premier usage de la transcription — licence MIT
+    https://huggingface.co/openai/whisper-large-v3-turbo
+
   - PyTorch — licence BSD
     https://pytorch.org
 

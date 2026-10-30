@@ -26,11 +26,15 @@ Tout fonctionne **en local** : vos textes et vos voix ne quittent jamais votre m
 
 ## Ce que fait l'application
 
-- 🎙️ **Clonage vocal** : à partir d'un extrait de 10 à 30 secondes et de sa transcription.
+- 🎙️ **Clonage vocal** : à partir d'un extrait de 10 à 30 secondes. Sa transcription peut être faite automatiquement par Whisper.
+- 🎭 **Dialogues à plusieurs voix** : un paragraphe qui commence par `[Marie]` est lu avec la voix de Marie.
 - 📄 **Lecture de documents** `.docx`, `.md` et `.txt`, avec nettoyage automatique : le Markdown, les emojis et les symboles sont retirés, les nombres et chiffres romains écrits en toutes lettres.
 - ⚡ **Génération rapide** : environ **7 secondes d'audio par seconde de calcul** sur une carte graphique récente (voir [Performances](#performances)).
 - 🎚️ **Exports** : WAV, MP3, rééchantillonnage en 44,1 ou 48 kHz.
 - 🎬 **Vidéo** : une image fixe et la piste audio deviennent une vidéo MP4 prête pour YouTube.
+- 🔎 **Contrôle qualité automatique** : Whisper réécoute chaque phrase générée et fait refaire celles qui ne correspondent pas au texte (mots sautés, répétitions).
+- 📖 **Livre audio M4B** : un chapitre par titre du document Word, avec couverture, titre et auteur, lisible dans toutes les applications de livres audio.
+- 💬 **Sous-titres** `.srt` synchronisés, et **correction** de quelques phrases sans relancer tout le rendu.
 - 📚 **Fusion et chapitres** : assemblage de plusieurs fichiers audio (les chapitres d'un livre, par exemple), avec génération automatique du chapitrage YouTube et des chapitres intégrés au fichier.
 
 ## Ce qu'il vous faut
@@ -40,7 +44,7 @@ Tout fonctionne **en local** : vos textes et vos voix ne quittent jamais votre m
 | Système | Windows 10 ou 11, 64 bits | |
 | Carte graphique | NVIDIA, 8 Go de mémoire vidéo | NVIDIA, 16 Go ou plus |
 | Pilote | NVIDIA récent (compatible CUDA 12.1) | |
-| Espace disque | 15 Go | |
+| Espace disque | 15 Go (17 Go avec Whisper) | |
 | Connexion Internet | pour l'installation et le premier téléchargement du modèle | |
 
 Sans carte NVIDIA, l'application fonctionne, mais beaucoup trop lentement pour un usage réel.
